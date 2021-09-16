@@ -1,15 +1,18 @@
 import numpy as np
 import gym
+import copy
 from numpy.ma.core import fabs
 
 def calc_value(env, gamma, value, policy) :
 
-	new_value = np.zeros(env.env.nS)
+	new_value = copy.deepcopy(value)	# acceleration! iterations : 1109->801
 
 	for s in range(env.env.nS) :
 		a = policy[s]
+		tmp = 0
 		for p,s2,r,d in env.env.P[s][a] :
-			new_value[s] += p*(r + gamma*value[s2])
+			tmp += p*(r + gamma*new_value[s2])
+		new_value[s] = tmp
 
 	return new_value
 
