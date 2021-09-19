@@ -155,6 +155,7 @@ def train_model(model, env, max_iter=10000, max_t=1000, device='cpu') :
 			# show_model(model, env, 100, max_t=max_t, device=device)
 		if running_reward > best_reward :
 			torch.save(model.state_dict(), "trained.model", _use_new_zipfile_serialization=False)
+			best_reward = running_reward
 
 if __name__ == '__main__' :
 
