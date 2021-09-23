@@ -5,163 +5,159 @@ import numpy as np
 import argparse
 import torch.nn.functional as F
 import copy
+import pandas as pd
 from torch.distributions import Categorical
 
 parser = argparse.ArgumentParser(description='PyTorch REINFORCE example')
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
-                    help='discount factor (default: 0.99)')
+					help='discount factor (default: 0.99)')
 parser.add_argument('--seed', type=int, default=543, metavar='N',
-                    help='random seed (default: 543)')
+					help='random seed (default: 543)')
 parser.add_argument('--render', action='store_true',
-                    help='render the environment')
+					help='render the environment')
 parser.add_argument('--log-interval', type=int, default=30, metavar='N',
-                    help='interval between training status logs (default: 10)')
+					help='interval between training status logs (default: 10)')
 args = parser.parse_args()
 eps = np.finfo(np.float32).eps.item()
 
-class agent(nn.Module) :
+class DuelingNet(nn.Module) :
 
-	def __init__(self, dim_in, dim_calc, dim_out) :
+	def __init__(self, n_state, n_hidden, n_output) :
 		super().__init__()
-		self.layer_1 = nn.Linear(dim_in, dim_calc)
-		self.layer_2 = nn.ReLU()
-		self.layer_3 = nn.Linear(dim_calc, dim_calc)
-		self.layer_4 = nn.ReLU()
-		self.layer_5 = nn.Linear(dim_calc, dim_out)
-		self.layer_6 = nn.ReLU()
-		self.layer_7 = nn.Softmax(dim=1)
-
-		self.stack_log_prob = []
-		self.stack_R = []
+		self.l1 = nn.Linear(n_state, n_hidden, bias=True)
+		self.l2 = nn.ReLU()
+		self.l3 = nn.Linear(n_hidden, n_output, bias=True)
+		self.l4 = nn.Linear(n_hidden, 1, bias=True)
 	
 	def forward(self, X) :
+		V1 = self.l1(X)
+		V2 = self.l2(V1)
+		V3 = self.l3(V2)
+		V4 = self.l4(V2).expand(V3.size())
+		V5 = V3+V4-V3.mean().expand(V3.size())
+		return V5
 
-		l1_tensor = self.layer_1(X)
-		l2_tensor = self.layer_2(l1_tensor)
-		l3_tensor = self.layer_3(l2_tensor)
-		l4_tensor = self.layer_4(l3_tensor)
-		l5_tensor = self.layer_5(l4_tensor)
-		l6_tensor = self.layer_6(l5_tensor)
-		l7_tensor = self.layer_7(l6_tensor)
-		
-		return l7_tensor
+class Replay :
+
+	def __init__(self, capacity) :
+		self.memory = pd.DataFrame(index=range(capacity), 
+			columns=['observation', 'action', 
+			'reward', 'next_observation', 'done'])
+		self.capacity = capacity
+		self.count = 0
+		self.top = 0
 	
-def get_action(model, state, device) :
-
-	state = torch.Tensor(state).to(device).unsqueeze(0)
-	option_prob = model(state)
-	m = Categorical(option_prob)
-	action = m.sample()
-	model.stack_log_prob.append(m.log_prob(action))	#log_prob will be used to calculate CE
-
-	return action.item()
-
-def show_model(model, env, show_round, max_t, device) :
-
-	model.to(device)
-
-	with torch.no_grad():
-		# model.eval()
-		for i in range(show_round) :
-			state = env.reset()
-			for t in range(max_t) :
-				env.render()
-				action = 0 # get_action(model, state, device)
-				state, reward, done, _ = env.step(action)
-				if done :
-					break
-		# model.train()
-	model.stack_log_prob.clear()
-	model.stack_R.clear()
-
-def test_model(model, env, test_round, max_t, device) :
-
-	model.to(device)
-
-	total_reward = 0
-
-	with torch.no_grad():
-		model.eval()
-		for i in range(test_round) :
-			state = env.reset()
-			round_R = 0
-			for t in range(max_t) :
-				action = get_action(model, state, device)
-				state, reward, done, _ = env.step(action)
-				round_R += reward
-				if done :
-					break
-			total_reward += round_R
-		model.train()
+	def store(self, *args) :
+		self.memory.loc[self.count] = args
+		self.count = (self.count+1) % self.capacity
+		self.top = min(self.top+1, self.capacity)
 	
-	avg_reward = total_reward/test_round
+	def sample(self, size) :
+		index = np.random.choice(self.top, size=size)
+		ret = (np.stack(self.memory.loc[index, field]) for field in self.memory.columns)
+		return ret
 
-	print('Average reward: {:.2f}'.format(avg_reward))
+class Agent() :
 
-	return avg_reward
-
-def update_model(model, optimizer) :
-	R = 0
-	loss = []
-	returns = []
-	for r in model.stack_R[::-1] :
-		R = r + args.gamma*R
-		returns.append(R)
-	returns = torch.tensor(list(reversed(returns)))
-	returns = (returns - returns.mean()) / (returns.std() + eps)
-	for log_prob, answer in zip(model.stack_log_prob, returns) :
-		loss.append(-log_prob * answer)
+	def __init__(self, n_state, n_hidden, n_output, lr=5e-4, gamma=0.9, epsilon=0.01, device='cpu') :
+		self.n_state = n_state
+		self.n_output = n_output
+		self.device = device
+		self.net1 = DuelingNet(n_state, n_hidden, n_output).to(self.device)
+		self.net2 = DuelingNet(n_state, n_hidden, n_output).to(self.device)
+		self.optimizer1 = torch.optim.Adam(self.net1.parameters(), lr=lr)
+		self.gamma = gamma
+		self.epsilon = epsilon
+		self.loss_func = nn.MSELoss()
+		self.replay = Replay(1024)
 	
-	optimizer.zero_grad()
-	loss = torch.cat(loss).sum()
-	loss.backward()
-	optimizer.step()
+	def action(self, state, israndom) :
+		cur = torch.Tensor(state).unsqueeze(dim=0).to(self.device)
+		if israndom and np.random.random() < self.epsilon :
+			return np.random.randint(0, self.n_output)
+		output = self.net1.forward(cur).cpu().detach().numpy()[0]
+		return np.argmax(output)
+	
+	def train(self, state, action, reward, next_state, done, batch_size) :
 
-	model.stack_log_prob.clear()
-	model.stack_R.clear()
+		self.replay.store(state, action, reward, next_state, int(done))
+
+		batch = list(self.replay.sample(batch_size))
+
+		state = torch.FloatTensor(batch[0]).to(self.device)
+		action = torch.LongTensor(batch[1]).unsqueeze(1).to(self.device)
+		reward = torch.FloatTensor(batch[2]).unsqueeze(1).to(self.device)
+		next_state = torch.FloatTensor(batch[3]).to(self.device)
+		done = torch.FloatTensor(batch[4]).unsqueeze(1).to(self.device)
+
+		# 获得下一状态的估值函数的最大值位置
+		a = self.net1.forward(next_state).argmax(dim=1).view(-1,1)
+		# 获取目标量
+		u = reward + self.gamma * self.net2.forward(next_state).gather(1, a) * done
+		v = self.net1.forward(state).gather(1, action)
+		loss = self.loss_func(v, u)
+		self.optimizer1.zero_grad()
+		loss.backward()
+		self.optimizer1.step()
+	
+	def save_model(self, episode) :
+		torch.save(self.net1.state_dict(), './saves/net1')
+		torch.save(self.net2.state_dict(), './saves/net2')
+		print('episode {} saved'.format(episode))
 
 
-def train_model(model, env, max_iter=10000, max_t=1000, device='cpu') :
+def train(env, model, max_episode) :
 
-	optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-2 ,weight_decay=1e-4)
+	best_test_reward = -200
 
-	model.train()
-	model = model.to(device)
-	print('Training on {}'.format(device))
-
-	running_reward = -200
-	best_reward = 0
-
-	for iteration in range(max_iter) :
-		model.stack_log_prob.clear()
-		model.stack_R.clear()
+	for i in range(max_episode) :
 		state = env.reset()
-		cur_reward = 0
-		max_reached = 0
-		total_kin = 0
-		for t in range(max_t) :
-			# run the model
-			if args.render and iteration % args.log_interval == 0 :
+		total_reward = 0
+		total_reward_real = 0
+		step_num = 0
+
+		if i%10 == 0:
+			model.net2.load_state_dict(model.net1.state_dict())
+		
+		while True :
+			if args.render :
 				env.render()
-				pass
-			action = get_action(model, state, device)
-			state, reward, done, _ = env.step(1)
-			max_reached = 100*(0.5*state[1]*state[1] + env.gravity*np.cos(state[0]*3-np.pi/2))	# kinetic energy
-			reward += max_reached
-			total_kin += max_reached
-			model.stack_R.append(reward)
-			cur_reward += reward
+			action = model.action(state, israndom=True)
+			next_state, reward_real, done, info = env.step(action)
+
+			Ek = next_state[1] * next_state[1] * 0.5
+			Ep = (np.sin(next_state[0]*3) + 1) * env.gravity
+			reward = (Ek + Ep)*100
+
+			model.train(state, action, reward, next_state, done, batch_size=10)
+			
+			state = next_state
+			total_reward += reward
+			total_reward_real += reward_real
+
+			step_num += 1
+
 			if done :
-				print(total_kin/t)
 				break
-		update_model(model, optimizer)
-		running_reward = 0.05 * cur_reward + (1 - 0.05) * running_reward
-		if iteration % args.log_interval == 0 :
-			print('Round {} Reward: {}'.format(iteration, running_reward))
-			# show_model(model, env, 100, max_t=max_t, device=device)
-		if running_reward > best_reward :
-			torch.save(model.state_dict(), "trained.model", _use_new_zipfile_serialization=False)
-			best_reward = running_reward
+				
+		print('episode {} , total reward: {} , total reward real: {}'.format(i, total_reward, total_reward_real))
+
+		if i % 10 == 0 :
+			for t in range(10) :
+				state = env.reset()
+				test_reward = 0
+				while True :
+					action = model.action(state, israndom=False)
+					next_state, reward_real, done, info = env.step(action)
+					test_reward += reward_real
+					state = next_state
+					if done :
+						break
+			avg_test_reward = test_reward / 10
+			print('test reward : {}'.format(avg_test_reward))
+			if avg_test_reward > best_test_reward :
+				best_test_reward = avg_test_reward
+				model.save_model(i)
 
 if __name__ == '__main__' :
 
@@ -170,8 +166,9 @@ if __name__ == '__main__' :
 
 	env.seed(args.seed)
 	torch.manual_seed(args.seed)
-
-	model = agent(2, 32, 3)
 	device = "cuda" if torch.cuda.is_available() else "cpu"
 
-	train_model(model, env, max_iter=3000, max_t=1000, device=device)
+	model = Agent(2, 64, 3, device=device)
+
+	train(env, model, 1024)
+	
