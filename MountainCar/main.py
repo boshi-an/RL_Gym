@@ -90,6 +90,9 @@ class Agent() :
 		next_state = torch.FloatTensor(batch[3]).to(self.device)
 		done = torch.FloatTensor(batch[4]).unsqueeze(1).to(self.device)
 
+		# Target: r + gamma * max(Q(s', a', w_))
+		# Current: Q(s,a,w)
+		# Gradient: nabla Q(s,a,w)
 		# 获得下一状态的估值函数的最大值位置
 		a = self.net1.forward(next_state).argmax(dim=1).view(-1,1)
 		# 获取目标量
