@@ -2,9 +2,11 @@ import os
 import argparse
 import gym
 import numpy as np
+import random
 from itertools import count
 
 import torch
+from torch.cuda import random
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -29,8 +31,8 @@ parser.add_argument('--batch_size', type=int, default=1, metavar='G',
 					help='Every how many episodes to do a param update')
 parser.add_argument('--save_round', type=int, default=1, metavar='G',
 					help='Every how many episodes to save model')
-parser.add_argument('--seed', type=int, default=123, metavar='N',
-					help='random seed (default: 123)')
+parser.add_argument('--seed', type=int, default=13, metavar='N',
+					help='random seed (default: 13)')
 parser.add_argument('--test', action='store_true',
 	   				help='whether to test the trained model or keep training')
 parser.add_argument('--render', action='store_true',
@@ -78,14 +80,16 @@ class myNet(nn.Module) :
 
 		return actions[0], values[0][0]
 
-	def selectAction(self, X) :
+	def selectAction(self, X, rand) :
 		
 		X = torch.Tensor(X).to(device)
 		probs, value = self(X)
 		m = Categorical(probs)
 		action = m.sample()
-		self.logProb[-1].append(m.log_prob(action))
-		self.value[-1].append(value)
+		
+		if not args.test :
+			self.logProb[-1].append(m.log_prob(action))
+			self.value[-1].append(value)
 
 		# print(probs.tolist())
 
@@ -148,15 +152,18 @@ def train(env, net : myNet, optimizer) :
 		state = env.reset()
 		
 		for tick in count(1) :
-			if args.render : env.render()
+			# if args.render : env.render()
 			state = state[35:195]
-			action = net.selectAction(state - lastState)	# try state - lastState 
+			action = net.selectAction(state - lastState, rand = True)	# try state - lastState 
 			lastState = state
 			state, reward, done, _ = env.step(action+2)
 
 			if not args.test : net.reward[-1].append(reward)
 
 			currentReward += reward
+
+			if reward > 0.01 :
+				print(reward)
 
 			if done :
 				runningReward = currentReward if runningReward is None else (runningReward*0.95 + currentReward*0.05)
@@ -170,12 +177,14 @@ def train(env, net : myNet, optimizer) :
 			net.reward = [[]]
 			net.logProb = [[]]
 			net.value = [[]]
+			
+		if episode % args.save_round == 0 and not args.test :
 			torch.save(net.state_dict(), 'latest.model'.format(episode))
 			print('Episode {} , model saved'.format(episode))
 		
 if __name__ == '__main__' :
 
-	env = gym.make('Pong-v0')
+	env = gym.make('Pong-v4', render_mode='human')
 	env.seed(args.seed)
 	torch.manual_seed(args.seed)
 
